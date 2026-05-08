@@ -21,7 +21,8 @@ const {
   VAPID_PUBLIC_KEY,
   VAPID_PRIVATE_KEY,
   VAPID_SUBJECT = "mailto:bookings@ravishingbeaute.salon",
-  ADMIN_TOKEN = "admin-authenticated"
+  ADMIN_TOKEN = "admin-authenticated",
+  DEPOSIT_PAYMENT_LINK = ""
 } = process.env;
 
 const BOOKING_STATUSES = ["pending", "confirmed", "cancelled", "archived"];
@@ -95,6 +96,12 @@ function normalizePhone(value) {
   return raw;
 }
 
+function normalizeBoolean(value) {
+  if (value === true || value === "true") return true;
+  if (value === false || value === "false") return false;
+  return null;
+}
+
 function normalizeFlexibleDate(value) {
   return value === true || value === "true";
 }
@@ -141,6 +148,8 @@ function mapBookingRow(row) {
     flexibleDate: row.flexible_date ? "true" : "false",
     timePreference: row.time_preference,
     status: row.status,
+    depositPaid: Boolean(row.deposit_paid),
+    depositPaidAt: row.deposit_paid_at,
     totalEstimate: row.total_estimate === null ? null : Number(row.total_estimate),
     notes: row.notes,
     addons: row.addons,
@@ -155,6 +164,13 @@ function mapServicePriceRow(row) {
     basePrice: Number(row.base_price),
     priceLabel: row.price_label,
     updatedAt: row.updated_at
+  };
+}
+
+function mapSettings(rows) {
+  const settings = Object.fromEntries(rows.map((row) => [row.key, row.value]));
+  return {
+    depositPaymentLink: settings.deposit_payment_link || DEPOSIT_PAYMENT_LINK || ""
   };
 }
 
@@ -189,6 +205,9 @@ async function initDb() {
     )
   `);
 
+  await pool.query("ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS deposit_paid BOOLEAN DEFAULT FALSE");
+  await pool.query("ALTER TABLE booking_requests ADD COLUMN IF NOT EXISTS deposit_paid_at TIMESTAMP");
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS service_price_overrides (
       service_id TEXT PRIMARY KEY,
@@ -198,7 +217,26 @@ async function initDb() {
     )
   `);
 
-  console.log("Push, booking, and service pricing tables ready.");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  if (DEPOSIT_PAYMENT_LINK) {
+    await pool.query(
+      `
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES ('deposit_payment_link', $1, NOW())
+      ON CONFLICT (key) DO NOTHING
+      `,
+      [DEPOSIT_PAYMENT_LINK]
+    );
+  }
+
+  console.log("Push, booking, service pricing, deposit, and settings tables ready.");
 }
 
 await initDb();
@@ -245,6 +283,7 @@ app.get("/", async (req, res) => {
     "SELECT COUNT(*) FROM push_subscriptions"
   );
   const bookingCount = await pool.query("SELECT COUNT(*) FROM booking_requests");
+  const depositPaidCount = await pool.query("SELECT COUNT(*) FROM booking_requests WHERE deposit_paid = TRUE");
   const priceCount = await pool.query("SELECT COUNT(*) FROM service_price_overrides");
 
   res.json({
@@ -252,6 +291,7 @@ app.get("/", async (req, res) => {
     service: "Ravishing Beauté Push + Booking Server",
     stored: Number(subscriptionCount.rows[0].count),
     bookings: Number(bookingCount.rows[0].count),
+    depositPaid: Number(depositPaidCount.rows[0].count),
     priceOverrides: Number(priceCount.rows[0].count)
   });
 });
@@ -269,6 +309,38 @@ app.get("/service-prices", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ ok: false, error: "Failed to fetch service pricing" });
+  }
+});
+
+app.get("/admin/settings", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query("SELECT key, value FROM app_settings");
+    res.json({ ok: true, settings: mapSettings(result.rows) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to fetch admin settings" });
+  }
+});
+
+app.patch("/admin/settings", requireAdmin, async (req, res) => {
+  try {
+    const depositPaymentLink = cleanString(req.body?.depositPaymentLink);
+
+    await pool.query(
+      `
+      INSERT INTO app_settings (key, value, updated_at)
+      VALUES ('deposit_payment_link', $1, NOW())
+      ON CONFLICT (key)
+      DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+      `,
+      [depositPaymentLink]
+    );
+
+    const result = await pool.query("SELECT key, value FROM app_settings");
+    res.json({ ok: true, settings: mapSettings(result.rows) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to update admin settings" });
   }
 });
 
@@ -485,23 +557,44 @@ app.patch("/admin/booking-requests/:id", requireAdmin, async (req, res) => {
   try {
     const id = Number(req.params.id);
     const status = cleanString(req.body?.status);
+    const depositPaid = normalizeBoolean(req.body?.depositPaid);
+    const updateParts = [];
+    const params = [];
 
     if (!Number.isFinite(id)) {
       return res.status(400).json({ error: "Invalid id" });
     }
 
-    if (!BOOKING_STATUSES.includes(status)) {
-      return res.status(400).json({ error: "Invalid status" });
+    if (status) {
+      if (!BOOKING_STATUSES.includes(status)) {
+        return res.status(400).json({ error: "Invalid status" });
+      }
+      params.push(status);
+      updateParts.push(`status = $${params.length}`);
     }
+
+    if (depositPaid !== null) {
+      params.push(depositPaid);
+      const depositIndex = params.length;
+      updateParts.push(`deposit_paid = $${depositIndex}`);
+      updateParts.push(`deposit_paid_at = CASE WHEN $${depositIndex} THEN NOW() ELSE NULL END`);
+    }
+
+    if (!updateParts.length) {
+      return res.status(400).json({ error: "No valid update provided" });
+    }
+
+    params.push(id);
+    const idIndex = params.length;
 
     const result = await pool.query(
       `
       UPDATE booking_requests
-      SET status = $1, updated_at = NOW()
-      WHERE id = $2
+      SET ${updateParts.join(", ")}, updated_at = NOW()
+      WHERE id = $${idIndex}
       RETURNING *
       `,
-      [status, id]
+      params
     );
 
     if (!result.rows.length) {
