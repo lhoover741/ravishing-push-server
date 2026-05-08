@@ -24,6 +24,8 @@ const {
   ADMIN_TOKEN = "admin-authenticated"
 } = process.env;
 
+const BOOKING_STATUSES = ["pending", "confirmed", "cancelled", "archived"];
+
 if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
   console.error("Missing VAPID keys.");
 }
@@ -488,7 +490,7 @@ app.patch("/admin/booking-requests/:id", requireAdmin, async (req, res) => {
       return res.status(400).json({ error: "Invalid id" });
     }
 
-    if (!["pending", "confirmed", "cancelled"].includes(status)) {
+    if (!BOOKING_STATUSES.includes(status)) {
       return res.status(400).json({ error: "Invalid status" });
     }
 
