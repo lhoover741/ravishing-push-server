@@ -113,6 +113,10 @@ function formatDate(value, flexibleDate) {
   }
 }
 
+function defaultPriceLabel(basePrice) {
+  return Number(basePrice) > 0 ? `$${Number(basePrice)}+` : "Custom";
+}
+
 function requireAdmin(req, res, next) {
   const auth = req.headers.authorization || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -139,6 +143,15 @@ function mapBookingRow(row) {
     notes: row.notes,
     addons: row.addons,
     createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapServicePriceRow(row) {
+  return {
+    serviceId: row.service_id,
+    basePrice: Number(row.base_price),
+    priceLabel: row.price_label,
     updatedAt: row.updated_at
   };
 }
@@ -174,7 +187,16 @@ async function initDb() {
     )
   `);
 
-  console.log("Push subscription and booking request tables ready.");
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS service_price_overrides (
+      service_id TEXT PRIMARY KEY,
+      base_price NUMERIC NOT NULL,
+      price_label TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+
+  console.log("Push, booking, and service pricing tables ready.");
 }
 
 await initDb();
@@ -221,17 +243,79 @@ app.get("/", async (req, res) => {
     "SELECT COUNT(*) FROM push_subscriptions"
   );
   const bookingCount = await pool.query("SELECT COUNT(*) FROM booking_requests");
+  const priceCount = await pool.query("SELECT COUNT(*) FROM service_price_overrides");
 
   res.json({
     ok: true,
     service: "Ravishing Beauté Push + Booking Server",
     stored: Number(subscriptionCount.rows[0].count),
-    bookings: Number(bookingCount.rows[0].count)
+    bookings: Number(bookingCount.rows[0].count),
+    priceOverrides: Number(priceCount.rows[0].count)
   });
 });
 
 app.get("/vapid-public-key", (req, res) => {
   res.json({ publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.get("/service-prices", async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM service_price_overrides ORDER BY service_id ASC"
+    );
+    res.json({ ok: true, prices: result.rows.map(mapServicePriceRow) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ ok: false, error: "Failed to fetch service pricing" });
+  }
+});
+
+app.get("/admin/service-prices", requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT * FROM service_price_overrides ORDER BY service_id ASC"
+    );
+    res.json({ ok: true, prices: result.rows.map(mapServicePriceRow) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to fetch service pricing" });
+  }
+});
+
+app.patch("/admin/service-prices/:serviceId", requireAdmin, async (req, res) => {
+  try {
+    const serviceId = cleanString(req.params.serviceId);
+    const rawBasePrice = req.body?.basePrice;
+    const basePrice = typeof rawBasePrice === "number" ? rawBasePrice : Number(rawBasePrice);
+    const priceLabel = cleanString(req.body?.priceLabel) || defaultPriceLabel(basePrice);
+
+    if (!serviceId) {
+      return res.status(400).json({ error: "Service id is required" });
+    }
+
+    if (!Number.isFinite(basePrice) || basePrice < 0) {
+      return res.status(400).json({ error: "Base price must be 0 or higher" });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO service_price_overrides (service_id, base_price, price_label, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (service_id)
+      DO UPDATE SET
+        base_price = EXCLUDED.base_price,
+        price_label = EXCLUDED.price_label,
+        updated_at = NOW()
+      RETURNING *
+      `,
+      [serviceId, basePrice, priceLabel]
+    );
+
+    res.json({ ok: true, price: mapServicePriceRow(result.rows[0]) });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to update service pricing" });
+  }
 });
 
 app.post("/subscribe", async (req, res) => {
