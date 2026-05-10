@@ -5,8 +5,8 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node --import ./gallery-preload.js server.js",
+    "dev": "node --import ./gallery-preload.js server.js"
   },
   "engines": {
     "node": ">=20"
