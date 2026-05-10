@@ -1,44 +1,28 @@
-import Module from "module";
+import express from "express";
+import pkg from "pg";
 import { mountGalleryRoutes } from "./gallery.js";
 
-const originalLoad = Module._load;
-let capturedApp = null;
-let capturedPool = null;
+const { Pool } = pkg;
+const originalListen = express.application.listen;
 let mounted = false;
 
-function tryMountGallery() {
-  if (mounted || !capturedApp || !capturedPool) return;
-  mounted = true;
-  setTimeout(() => {
-    mountGalleryRoutes(capturedApp, capturedPool, { adminToken: process.env.ADMIN_TOKEN || "admin-authenticated" })
-      .then(() => console.log("Ravishing Beauté gallery routes ready."))
-      .catch((error) => console.error("Gallery routes failed:", error));
-  }, 0);
+function createGalleryPool() {
+  return new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+  });
 }
 
-Module._load = function patchedModuleLoad(request, parent, isMain) {
-  const loaded = originalLoad.apply(this, arguments);
-
-  if (request === "express" && typeof loaded === "function") {
-    function wrappedExpress(...args) {
-      capturedApp = loaded(...args);
-      tryMountGallery();
-      return capturedApp;
-    }
-    Object.assign(wrappedExpress, loaded);
-    return wrappedExpress;
+express.application.listen = function patchedListen(...args) {
+  if (!mounted) {
+    mounted = true;
+    const galleryPool = createGalleryPool();
+    void mountGalleryRoutes(this, galleryPool, {
+      adminToken: process.env.ADMIN_TOKEN || "admin-authenticated",
+    })
+      .then(() => console.log("Ravishing Beauté gallery routes ready."))
+      .catch((error) => console.error("Gallery routes failed:", error));
   }
 
-  if (request === "pg" && loaded && typeof loaded.Pool === "function") {
-    class GalleryPool extends loaded.Pool {
-      constructor(...args) {
-        super(...args);
-        capturedPool = this;
-        tryMountGallery();
-      }
-    }
-    return { ...loaded, Pool: GalleryPool };
-  }
-
-  return loaded;
+  return originalListen.apply(this, args);
 };
