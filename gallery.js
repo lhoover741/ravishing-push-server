@@ -44,9 +44,11 @@ function readRawBody(req) {
 }
 
 function mapGalleryRow(row, req) {
+  const baseUrl = `${req.protocol}://${req.get("host")}`;
   return {
     id: Number(row.id),
-    imageUrl: `${req.protocol}://${req.get("host")}/gallery/image/${row.id}`,
+    imageUrl: `${baseUrl}/gallery/image/${row.id}`,
+    adminImageUrl: `${baseUrl}/admin/gallery/image/${row.id}`,
     caption: row.caption || "",
     category: row.category || "Style",
     featured: Boolean(row.featured),
